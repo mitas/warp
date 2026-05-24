@@ -972,7 +972,12 @@ impl LLMPreferences {
             .data()
             .base_model
             .as_ref()
-            .and_then(|id| self.models_by_feature.agent_mode.info_for_id(id))
+            .and_then(|id| {
+                self.models_by_feature
+                    .agent_mode
+                    .info_for_id(id)
+                    .or_else(|| self.custom_llm_info_for_id_if_enabled(id, ctx))
+            })
             .unwrap_or_else(|| self.models_by_feature.agent_mode.default_llm_info())
             .id
             .clone();
@@ -1191,7 +1196,10 @@ impl LLMPreferences {
                     let effective_base_model_usable = self
                         .models_by_feature
                         .agent_mode
-                        .usable_info_for_id(effective_base_model_id, ctx);
+                        .usable_info_for_id(effective_base_model_id, ctx)
+                        .or_else(|| {
+                            self.custom_llm_info_for_id_if_enabled(effective_base_model_id, ctx)
+                        });
                     let effective_base_model_unusable = effective_base_model_usable.is_none();
                     let effective_base_model_is_configurable = effective_base_model_usable
                         .is_some_and(|info| info.context_window.is_configurable);
@@ -1219,6 +1227,9 @@ impl LLMPreferences {
                         if self
                             .get_cli_agent_available()
                             .usable_info_for_id(preferred_llm_id, ctx)
+                            .or_else(|| {
+                                self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
+                            })
                             .is_none()
                         {
                             profiles.set_cli_agent_model(profile_id, None, ctx);

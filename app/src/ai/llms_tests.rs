@@ -1,5 +1,22 @@
 use super::*;
 
+use warp_core::features::FeatureFlag;
+use warpui::{App, EntityId, SingletonEntity};
+
+use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
+use crate::auth::auth_manager::AuthManager;
+use crate::auth::AuthStateProvider;
+use crate::cloud_object::model::persistence::CloudModel;
+use crate::network::NetworkStatus;
+use crate::server::cloud_objects::update_manager::UpdateManager;
+use crate::server::server_api::ServerApiProvider;
+use crate::server::sync_queue::SyncQueue;
+use crate::settings::PrivacySettings;
+use crate::test_util::settings::initialize_settings_for_tests;
+use crate::workspaces::team_tester::TeamTesterStatus;
+use crate::workspaces::user_workspaces::UserWorkspaces;
+use crate::{LaunchMode, TemplatableMCPServerManager};
+
 // -- DisableReason::should_clear_preference tests --
 
 #[test]
@@ -279,6 +296,190 @@ fn custom_llm_infos_skip_models_without_config_key() {
     let infos = build_custom_llm_infos(&keys);
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].display_name, "ready");
+}
+
+fn install_llm_profile_singletons(app: &mut App) {
+    initialize_settings_for_tests(app);
+    app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+    app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+    app.add_singleton_model(AuthManager::new_for_test);
+    app.add_singleton_model(SyncQueue::mock);
+    app.add_singleton_model(|_| NetworkStatus::new());
+    app.add_singleton_model(TeamTesterStatus::mock);
+    app.add_singleton_model(UpdateManager::mock);
+    app.add_singleton_model(CloudModel::mock);
+    app.add_singleton_model(|_| TemplatableMCPServerManager::default());
+    app.add_singleton_model(PrivacySettings::mock);
+    app.add_singleton_model(UserWorkspaces::default_mock);
+}
+
+#[test]
+fn reconcile_disabled_models_preserves_enabled_custom_base_model() {
+    App::test((), |mut app| async move {
+        let _custom_inference = FeatureFlag::CustomInferenceEndpoints.override_enabled(true);
+        install_llm_profile_singletons(&mut app);
+
+        let custom_model_id = LLMId::from("custom-model-config-key");
+        ApiKeyManager::handle(&app).update(&mut app, |api_keys, ctx| {
+            api_keys.add_custom_endpoint(
+                "Local OpenAI-compatible endpoint".to_string(),
+                "https://example.test/v1".to_string(),
+                "test-key".to_string(),
+                vec![(
+                    "custom-model".to_string(),
+                    None,
+                    Some(custom_model_id.to_string()),
+                )],
+                ctx,
+            );
+        });
+
+        let profiles = app.add_singleton_model(|ctx| {
+            AIExecutionProfilesModel::new(&LaunchMode::new_for_unit_test(), ctx)
+        });
+        let llms = app.add_singleton_model(LLMPreferences::new);
+
+        let default_profile_id =
+            profiles.read(&app, |profiles, _ctx| profiles.default_profile_id());
+        profiles.update(&mut app, |profiles, ctx| {
+            profiles.set_base_model(default_profile_id, Some(custom_model_id.clone()), ctx);
+        });
+
+        llms.update(&mut app, |llms, ctx| {
+            llms.reconcile_disabled_model_preferences(ctx);
+        });
+
+        profiles.read(&app, |profiles, ctx| {
+            assert_eq!(
+                profiles.default_profile(ctx).data().base_model.as_ref(),
+                Some(&custom_model_id),
+                "enabled custom base model should survive disabled-model reconciliation",
+            );
+        });
+    });
+}
+
+#[test]
+fn reconcile_disabled_models_preserves_enabled_custom_cli_agent_model() {
+    App::test((), |mut app| async move {
+        let _custom_inference = FeatureFlag::CustomInferenceEndpoints.override_enabled(true);
+        install_llm_profile_singletons(&mut app);
+
+        let custom_model_id = LLMId::from("custom-cli-agent-model-config-key");
+        ApiKeyManager::handle(&app).update(&mut app, |api_keys, ctx| {
+            api_keys.add_custom_endpoint(
+                "Local OpenAI-compatible endpoint".to_string(),
+                "https://example.test/v1".to_string(),
+                "test-key".to_string(),
+                vec![(
+                    "custom-cli-agent-model".to_string(),
+                    None,
+                    Some(custom_model_id.to_string()),
+                )],
+                ctx,
+            );
+        });
+
+        let profiles = app.add_singleton_model(|ctx| {
+            AIExecutionProfilesModel::new(&LaunchMode::new_for_unit_test(), ctx)
+        });
+        let llms = app.add_singleton_model(LLMPreferences::new);
+
+        let default_profile_id =
+            profiles.read(&app, |profiles, _ctx| profiles.default_profile_id());
+        profiles.update(&mut app, |profiles, ctx| {
+            profiles.set_cli_agent_model(default_profile_id, Some(custom_model_id.clone()), ctx);
+        });
+
+        llms.update(&mut app, |llms, ctx| {
+            llms.reconcile_disabled_model_preferences(ctx);
+        });
+
+        profiles.read(&app, |profiles, ctx| {
+            assert_eq!(
+                profiles.default_profile(ctx).data().cli_agent_model.as_ref(),
+                Some(&custom_model_id),
+                "enabled custom full terminal use model should survive disabled-model reconciliation",
+            );
+        });
+    });
+}
+
+#[test]
+fn selecting_profile_custom_base_model_does_not_create_terminal_override() {
+    App::test((), |mut app| async move {
+        let _custom_inference = FeatureFlag::CustomInferenceEndpoints.override_enabled(true);
+        install_llm_profile_singletons(&mut app);
+
+        let custom_base_model_id = LLMId::from("custom-base-model-config-key");
+        let custom_cli_agent_model_id = LLMId::from("custom-cli-agent-model-config-key");
+        ApiKeyManager::handle(&app).update(&mut app, |api_keys, ctx| {
+            api_keys.add_custom_endpoint(
+                "Local OpenAI-compatible endpoint".to_string(),
+                "https://example.test/v1".to_string(),
+                "test-key".to_string(),
+                vec![
+                    (
+                        "custom-base-model".to_string(),
+                        None,
+                        Some(custom_base_model_id.to_string()),
+                    ),
+                    (
+                        "custom-cli-agent-model".to_string(),
+                        None,
+                        Some(custom_cli_agent_model_id.to_string()),
+                    ),
+                ],
+                ctx,
+            );
+        });
+
+        let profiles = app.add_singleton_model(|ctx| {
+            AIExecutionProfilesModel::new(&LaunchMode::new_for_unit_test(), ctx)
+        });
+        let llms = app.add_singleton_model(LLMPreferences::new);
+        let terminal_view_id = EntityId::new();
+
+        let default_profile_id =
+            profiles.read(&app, |profiles, _ctx| profiles.default_profile_id());
+        profiles.update(&mut app, |profiles, ctx| {
+            profiles.set_base_model(default_profile_id, Some(custom_base_model_id.clone()), ctx);
+            profiles.set_cli_agent_model(
+                default_profile_id,
+                Some(custom_cli_agent_model_id.clone()),
+                ctx,
+            );
+        });
+
+        llms.update(&mut app, |llms, ctx| {
+            llms.update_preferred_agent_mode_llm(
+                &custom_base_model_id,
+                terminal_view_id,
+                ctx,
+            );
+        });
+
+        profiles.read(&app, |profiles, ctx| {
+            let profile = profiles.default_profile(ctx);
+            assert_eq!(
+                profile.data().base_model.as_ref(),
+                Some(&custom_base_model_id),
+                "custom base model should remain persisted on the execution profile",
+            );
+            assert_eq!(
+                profile.data().cli_agent_model.as_ref(),
+                Some(&custom_cli_agent_model_id),
+                "custom full terminal use model should remain persisted on the execution profile",
+            );
+        });
+        llms.read(&app, |llms, _ctx| {
+            assert_eq!(
+                llms.get_base_llm_override(terminal_view_id),
+                None,
+                "reselecting the profile's custom base model should not create a restart-only terminal override",
+            );
+        });
+    });
 }
 
 #[test]
